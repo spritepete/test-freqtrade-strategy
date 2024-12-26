@@ -20,70 +20,98 @@ class TestStrategy(IStrategy):
         dataframe['rolling_avg'] = dataframe['close'].rolling(window=self.window_size, min_periods=1).mean()
         dataframe['step_size'] = dataframe['rolling_avg'] * self.step_percentage
         
-        # Track high/low levels and generate Renko bars
-        current_high = dataframe['close'].iloc[0]
-        current_low = dataframe['close'].iloc[0]
-        current_trend = None
-        last_brick_price = dataframe['close'].iloc[0]
+        # Initialize tracking columns
+        dataframe['current_level'] = None  # Current price level
+        dataframe['level_count'] = 0  # How many candles spent at current level
+        dataframe['trend'] = None  # Current trend direction
+        dataframe['trend_strength'] = 0  # Count of consecutive levels in same direction
+        dataframe['max_price'] = dataframe['close']  # Max price seen in current level
+        dataframe['min_price'] = dataframe['close']  # Min price seen in current level
         
-        dataframe['trend'] = None
-        dataframe['brick_high'] = None
-        dataframe['brick_low'] = None
-        
-        for idx in range(len(dataframe)):
-            close = dataframe['close'].iloc[idx]
-            step = dataframe['step_size'].iloc[idx]
+        # Start from first valid step size
+        start_idx = dataframe['step_size'].first_valid_index()
+        if start_idx is None:
+            return dataframe
             
-            if current_trend is None:
-                if close >= last_brick_price + step:
-                    current_trend = True
-                    last_brick_price = close - (close % step)
-                elif close <= last_brick_price - step:
-                    current_trend = False
-                    last_brick_price = close + (step - (close % step))
-            elif current_trend:  # In uptrend
-                current_high = max(current_high, close)
-                if close <= last_brick_price - (2 * step):  # Reversal
-                    dataframe.loc[idx, 'trend'] = False
-                    dataframe.loc[idx, 'brick_high'] = current_high
-                    dataframe.loc[idx, 'brick_low'] = close
-                    current_trend = False
-                    last_brick_price = close + (step - (close % step))
-                    current_high = close
-                    current_low = close
-                elif close >= last_brick_price + step:  # Continue trend
-                    dataframe.loc[idx, 'trend'] = True
-                    dataframe.loc[idx, 'brick_high'] = close
-                    dataframe.loc[idx, 'brick_low'] = last_brick_price
-                    last_brick_price = close - (close % step)
-            else:  # In downtrend
-                current_low = min(current_low, close)
-                if close >= last_brick_price + (2 * step):  # Reversal
-                    dataframe.loc[idx, 'trend'] = True
-                    dataframe.loc[idx, 'brick_high'] = close
-                    dataframe.loc[idx, 'brick_low'] = current_low
-                    current_trend = True
-                    last_brick_price = close - (close % step)
-                    current_high = close
-                    current_low = close
-                elif close <= last_brick_price - step:  # Continue trend
-                    dataframe.loc[idx, 'trend'] = False
-                    dataframe.loc[idx, 'brick_high'] = last_brick_price
-                    dataframe.loc[idx, 'brick_low'] = close
-                    last_brick_price = close + (step - (close % step))
+        # Initialize first level
+        first_close = dataframe.loc[start_idx, 'close']
+        first_step = dataframe.loc[start_idx, 'step_size']
+        current_level = first_close - (first_close % first_step)
+        current_trend = None
+        trend_strength = 0
+        level_count = 0
+        max_price = first_close
+        min_price = first_close
         
+        # Process each candle
+        for idx in range(start_idx, len(dataframe)):
+            close = dataframe.loc[idx, 'close']
+            step = dataframe.loc[idx, 'step_size']
+            
+            # Update max/min prices
+            max_price = max(max_price, close)
+            min_price = min(min_price, close)
+            
+            # Check if price moved to new level
+            levels_up = int((max_price - current_level) / step)
+            levels_down = int((current_level - min_price) / step)
+            
+            if levels_up >= 1 or levels_down >= 1:
+                # Price moved beyond current level
+                new_trend = True if levels_up >= 1 else False
+                
+                if current_trend is None:
+                    # First trend establishment
+                    current_trend = new_trend
+                    trend_strength = 1
+                elif new_trend == current_trend:
+                    # Trend continuation
+                    trend_strength += 1
+                else:
+                    # Trend reversal
+                    current_trend = new_trend
+                    trend_strength = 1
+                
+                # Update level
+                if new_trend:
+                    current_level += step * levels_up
+                else:
+                    current_level -= step * levels_down
+                    
+                # Reset counters
+                level_count = 0
+                max_price = close
+                min_price = close
+            else:
+                # Still within current level
+                level_count += 1
+            
+            # Update dataframe
+            dataframe.loc[idx, 'current_level'] = current_level
+            dataframe.loc[idx, 'level_count'] = level_count
+            dataframe.loc[idx, 'trend'] = current_trend
+            dataframe.loc[idx, 'trend_strength'] = trend_strength
+            dataframe.loc[idx, 'max_price'] = max_price
+            dataframe.loc[idx, 'min_price'] = min_price
+        
+        # Add previous trend for signal generation
         dataframe['previous_trend'] = dataframe['trend'].shift(1)
+        dataframe['previous_strength'] = dataframe['trend_strength'].shift(1)
+        
         return dataframe
 
     def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe['buy'] = 0
         dataframe['sell'] = 0
         
-        # Buy on trend reversal from down to up or trend continuation in uptrend
+        # Buy conditions:
+        # 1. Trend reversal from down to up
+        # 2. Strong uptrend continuation (trend_strength >= 2)
         buy_mask = (
             ((dataframe['previous_trend'] == False) & (dataframe['trend'] == True)) |
-            ((dataframe['previous_trend'] == True) & (dataframe['trend'] == True))
+            ((dataframe['trend'] == True) & (dataframe['trend_strength'] >= 2))
         )
+        
         dataframe.loc[buy_mask, 'buy'] = 1
         dataframe.loc[~buy_mask, 'sell'] = 1
         
